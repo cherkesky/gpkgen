@@ -1,0 +1,17 @@
+__pycache__
+*.pyc
+*.pkl
+*.npz
+*.png
+*.jpg
+*.jpeg
+/env
+/media
+/vqgan_output
+*.DS_Store
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.heic
