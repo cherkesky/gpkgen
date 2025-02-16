@@ -228,15 +228,18 @@ def train_vqgan_clip(
             print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f}")
             
             if (epoch + 1) % 10 == 0:
+                # Save parameters as a dictionary of numpy arrays
                 checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}.npz")
-                mx.save(checkpoint_path, vqgan.parameters())
+                params_dict = {k: v.numpy() for k, v in vqgan.parameters().items()}
+                np.savez(checkpoint_path, **params_dict)
                 print(f"Saved checkpoint to {checkpoint_path}")
                 
     except Exception as e:
         print(f"Training interrupted: {e}")
         # Save emergency checkpoint
         emergency_path = os.path.join(output_dir, "emergency_checkpoint.npz")
-        mx.save(emergency_path, vqgan.parameters())
+        params_dict = {k: v.numpy() for k, v in vqgan.parameters().items()}
+        np.savez(emergency_path, **params_dict)
         print(f"Saved emergency checkpoint to {emergency_path}")
         raise e
 
