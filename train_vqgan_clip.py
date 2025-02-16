@@ -147,6 +147,19 @@ def load_and_preprocess_images(image_folder, image_size=224, cache_file="process
     
     return images
 
+def flatten_params(params, prefix=''):
+    flat_params = {}
+    for k, v in params.items():
+        if isinstance(v, dict):
+            # Recursively flatten nested dictionaries
+            nested_params = flatten_params(v, prefix=f"{prefix}{k}.")
+            flat_params.update(nested_params)
+        else:
+            # Ensure we have a valid MLX array
+            if hasattr(v, 'numpy'):
+                flat_params[f"{prefix}{k}"] = mx.eval(v).numpy()
+    return flat_params
+
 def train_vqgan_clip(
     media_folder: str,
     output_dir: str,
@@ -228,19 +241,27 @@ def train_vqgan_clip(
             print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f}")
             
             if (epoch + 1) % 10 == 0:
-                # Save parameters as a dictionary of numpy arrays
                 checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}.npz")
-                params_dict = {k: v.numpy() for k, v in vqgan.parameters().items()}
-                np.savez(checkpoint_path, **params_dict)
-                print(f"Saved checkpoint to {checkpoint_path}")
+                # Flatten and save parameters
+                params_dict = flatten_params(vqgan.parameters())
                 
+                if params_dict:
+                    np.savez(checkpoint_path, **params_dict)
+                    print(f"Saved checkpoint to {checkpoint_path}")
+                else:
+                    print("Warning: No valid parameters to save in checkpoint")
+
     except Exception as e:
         print(f"Training interrupted: {e}")
-        # Save emergency checkpoint
+        # Save emergency checkpoint with same robust logic
         emergency_path = os.path.join(output_dir, "emergency_checkpoint.npz")
-        params_dict = {k: v.numpy() for k, v in vqgan.parameters().items()}
-        np.savez(emergency_path, **params_dict)
-        print(f"Saved emergency checkpoint to {emergency_path}")
+        params_dict = flatten_params(vqgan.parameters())
+        
+        if params_dict:
+            np.savez(emergency_path, **params_dict)
+            print(f"Saved emergency checkpoint to {emergency_path}")
+        else:
+            print("Warning: No valid parameters to save in emergency checkpoint")
         raise e
 
 if __name__ == "__main__":
