@@ -29,22 +29,42 @@ class VQGANInference:
         
         # Load VQGAN
         self.vqgan = VQGAN()
-        # Load the saved parameters
+        
+        # Load and inspect the checkpoint
+        print("\n=== Checkpoint Inspection ===")
         checkpoint = np.load(checkpoint_path, allow_pickle=True)
+        
+        # Print all available keys
+        print("\nCheckpoint keys:")
+        for key in checkpoint.files:
+            array = checkpoint[key]
+            if isinstance(array, np.ndarray):
+                print(f"- {key}: shape={array.shape}, dtype={array.dtype}")
+            else:
+                print(f"- {key}: type={type(array)}")
+        
+        # Print some basic statistics for a few key arrays
+        print("\nKey arrays statistics:")
+        for key in checkpoint.files:
+            array = checkpoint[key]
+            if isinstance(array, np.ndarray) and array.dtype != np.dtype('O'):
+                print(f"\n{key}:")
+                print(f"  - Min: {np.min(array)}")
+                print(f"  - Max: {np.max(array)}")
+                print(f"  - Mean: {np.mean(array)}")
+                print(f"  - Std: {np.std(array)}")
         
         # Convert parameters recursively
         def convert_to_mlx(v):
             if isinstance(v, np.ndarray):
-                if v.dtype == np.dtype('O'):  # Handle object arrays
+                if v.dtype == np.dtype('O'):
                     if v.size == 1:
                         return convert_to_mlx(v.item())
-                    # Convert object array to list first
                     return [convert_to_mlx(item) for item in v]
                 return mx.array(v.astype(np.float32))
             elif isinstance(v, dict):
                 return {k: convert_to_mlx(v) for k, v in v.items()}
             elif isinstance(v, list):
-                # Only convert to mx.array if all elements are numeric
                 if all(not isinstance(x, (dict, list)) for x in v):
                     return mx.array(v)
                 return [convert_to_mlx(item) for item in v]
@@ -52,6 +72,7 @@ class VQGANInference:
             
         params = {k: convert_to_mlx(v) for k, v in checkpoint.items()}
         self.vqgan.update(params)
+        print("\n=== Checkpoint Loading Complete ===\n")
         
     def get_text_embeddings(self, text_prompt: str) -> mx.array:
         """Convert text prompt to CLIP embeddings"""
@@ -66,16 +87,10 @@ class VQGANInference:
                 
                 # Convert to numpy then MLX array
                 text_features_np = text_features.cpu().numpy().astype(np.float32)
+                text_features_np = text_features_np.squeeze()  # Remove extra dimensions
                 
-                # Create MLX array
+                # Create MLX array and ensure proper shape
                 mlx_features = mx.array(text_features_np)
-                
-                # Verify the array exists and has the correct shape
-                if not isinstance(mlx_features, mx.array):
-                    raise ValueError(f"Failed to create MLX array. Got type: {type(mlx_features)}")
-                
-                # Force synchronous evaluation
-                mx.eval(mlx_features)
                 
                 return mlx_features
                 
@@ -86,31 +101,25 @@ class VQGANInference:
     def sample_latents(self, batch_size: int = 1, temperature: float = 1.0) -> mx.array:
         """Sample latent vectors for generation"""
         try:
-            # Get spatial dimensions from VQGAN architecture
             spatial_size = 16  # This should match your trained model
             embedding_dim = self.vqgan.vq_layer.embedding_dim
             
-            print(f"Generating latents with dimensions: batch={batch_size}, dim={embedding_dim}, size={spatial_size}")
-            
-            # Create random values using numpy first
-            np_latents = np.random.normal(
-                loc=0.0,
-                scale=1.0,
-                size=(batch_size, embedding_dim, spatial_size, spatial_size)
+            # Use truncated normal distribution to avoid extreme values
+            np_latents = np.clip(
+                np.random.normal(
+                    loc=0.0,
+                    scale=1.0,  # Increased scale significantly
+                    size=(batch_size, embedding_dim, spatial_size, spatial_size)
+                ),
+                -2,  # Clip values to avoid extremes
+                2
             ).astype(np.float32)
             
-            # Convert to MLX array
             latents = mx.array(np_latents)
-            print(f"Initial latents shape: {latents.shape}")
             
-            # Apply temperature scaling
+            # Apply temperature without additional scaling
             latents = latents * temperature
             
-            # Instead of using mx.eval(), we'll verify the array exists
-            if not isinstance(latents, mx.array):
-                raise ValueError(f"Expected MLX array, got {type(latents)}")
-            
-            print(f"Final latents shape: {latents.shape}")
             return latents
             
         except Exception as e:
@@ -124,32 +133,31 @@ class VQGANInference:
         temperature: float = 1.0,
         return_pil: bool = True
     ):
-        """Generate images from text prompt"""
+        """Generate images using VQGAN"""
         try:
-            # Get text embeddings
+            # Keep text embeddings calculation for future use and debugging
             text_embeddings = self.get_text_embeddings(text_prompt)
             if text_embeddings is None:
                 raise ValueError("Text embeddings evaluation returned None")
             print(f"Text embeddings shape: {text_embeddings.shape}")
+            print(f"Text embeddings range: {mx.min(text_embeddings):.3f} to {mx.max(text_embeddings):.3f}")
             
-            # Sample latents
-            latents = self.sample_latents(num_samples, temperature)
+            # Sample latents with reduced temperature
+            latents = self.sample_latents(num_samples, temperature * 0.5)  # Reduced temperature
             if latents is None:
                 raise ValueError("Latents generation returned None")
             print(f"Latents shape before transpose: {latents.shape}")
+            print(f"Latents range: {mx.min(latents):.3f} to {mx.max(latents):.3f}")
             
-            # Convert to numpy, transpose, and back to MLX
-            # First ensure we have a valid MLX array
-            if not isinstance(latents, mx.array):
-                raise ValueError("Expected MLX array for latents")
-                
-            # Convert the dimensions directly using MLX operations
+            # Convert to proper format for decoder
             latents = mx.transpose(latents, (0, 2, 3, 1))
             print(f"Latents shape after transpose: {latents.shape}")
             
             # Generate images
             print("Calling VQGAN decode...")
             images = self.vqgan.decode(latents)
+            print(f"Decoded images shape: {images.shape}")
+            print(f"Decoded images range: {mx.min(images):.3f} to {mx.max(images):.3f}")
             
             # Convert to PIL images if requested
             if return_pil:
@@ -160,6 +168,7 @@ class VQGANInference:
                 # Convert to numpy array for PIL
                 images_np = np.array(images)
                 print(f"Final image shape: {images_np.shape}")
+                print(f"Final image range: {np.min(images_np)} to {np.max(images_np)}")
                 
                 pil_images = []
                 for img in images_np:
@@ -194,11 +203,11 @@ if __name__ == "__main__":
     # Initialize model
     model = VQGANInference(checkpoint_path=args.checkpoint)
     
-    # Generate images
+    # Generate images with adjusted temperature
     images = model.generate_images(
         text_prompt=args.prompt,
         num_samples=args.num_images,
-        temperature=args.temperature
+        temperature=args.temperature  # Remove the 0.1 scaling here
     )
     
     # Save the generated images
