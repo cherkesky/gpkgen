@@ -197,6 +197,64 @@ def save_sample_images(vqgan, batch, epoch, output_dir):
         combined.paste(recon_img, (224, 0))
         combined.save(os.path.join(output_dir, f'comparison_epoch{epoch}_sample{i}.png'))
 
+def validate_dataset(images, output_dir):
+    """Validate and analyze the training dataset"""
+    print("\n=== Dataset Validation ===")
+    
+    # Basic statistics
+    print(f"Number of images: {len(images)}")
+    print(f"Image shape: {images[0].shape}")
+    print(f"Value range: [{mx.min(images):.3f}, {mx.max(images):.3f}]")
+    print(f"Mean: {mx.mean(images):.3f}")
+    print(f"Std: {mx.std(images):.3f}")
+    
+    # Check for potential issues
+    issues = []
+    if len(images) < 1000:
+        issues.append("WARNING: Dataset might be too small (< 1000 images)")
+    if mx.min(images) > -0.9 or mx.max(images) < 0.9:
+        issues.append("WARNING: Images might not use full [-1, 1] range")
+    if mx.std(images) < 0.2:
+        issues.append("WARNING: Low image variance - dataset might lack diversity")
+    
+    # Save sample images for visual inspection
+    sample_dir = os.path.join(output_dir, 'dataset_samples')
+    os.makedirs(sample_dir, exist_ok=True)
+    
+    # Save 10 random samples
+    num_samples = min(10, len(images))
+    indices = list(range(len(images)))
+    np.random.shuffle(indices)
+    
+    for i in range(num_samples):
+        # Use proper MLX array slicing
+        start_idx = indices[i]
+        end_idx = indices[i] + 1
+        img_array = images[start_idx:end_idx][0]  # Get single image
+        
+        # Convert to numpy array
+        img_array = img_array.tolist()
+        img_array = np.array(img_array)
+        
+        # Convert from [-1, 1] to [0, 255]
+        img_array = ((img_array + 1) * 127.5).astype(np.uint8)
+        
+        # Save image
+        img = Image.fromarray(img_array)
+        img.save(os.path.join(sample_dir, f'sample_{i}.png'))
+    
+    # Print issues
+    if issues:
+        print("\nPotential issues found:")
+        for issue in issues:
+            print(f"- {issue}")
+    else:
+        print("\nNo major issues found in dataset")
+    
+    print("\nSaved 10 random samples to", sample_dir)
+    print("Please inspect these samples for visual quality")
+    print("=== Dataset Validation Complete ===\n")
+
 def train_vqgan_clip(
     media_folder: str,
     output_dir: str,
@@ -229,6 +287,9 @@ def train_vqgan_clip(
     
     # Load dataset with caching - hardcoded to 224x224 for CLIP compatibility
     images = load_and_preprocess_images(media_folder, image_size=224, cache_file="processed_images.pkl")
+    
+    # Add dataset validation
+    validate_dataset(images, output_dir)
     
     # Setup optimizer with learning rate schedule
     lr_schedule = cosine_decay_schedule(
