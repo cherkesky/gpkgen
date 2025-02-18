@@ -169,13 +169,15 @@ def flatten_params(params, prefix=''):
                 flat_params[f"{prefix}{k}"] = v
     return flat_params
 
-def cosine_decay_schedule(initial_lr, min_lr, total_steps):
+def get_lr_schedule(initial_lr, warmup_epochs, total_epochs, num_batches):
     def schedule(step):
-        if step >= total_steps:
-            return min_lr
-        progress = step / total_steps
-        cosine_decay = 0.5 * (1 + mx.cos(mx.pi * progress))
-        return min_lr + (initial_lr - min_lr) * cosine_decay
+        epoch = step / num_batches
+        # Warmup phase
+        if epoch < warmup_epochs:
+            return initial_lr * (epoch / warmup_epochs)
+        # Cosine decay after warmup
+        progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+        return initial_lr * 0.5 * (1 + mx.cos(mx.pi * progress))
     return schedule
 
 def save_sample_images(vqgan, batch, epoch, output_dir):
@@ -291,60 +293,34 @@ def train_vqgan_clip(
     # Add dataset validation
     validate_dataset(images, output_dir)
     
-    # Setup optimizer with learning rate schedule
-    lr_schedule = cosine_decay_schedule(
+    # Add warmup to optimizer
+    num_batches = len(images) // batch_size
+    lr_schedule = get_lr_schedule(
         initial_learning_rate,
-        min_learning_rate,
-        num_epochs * (len(images) // batch_size)
+        warmup_epochs=5,
+        total_epochs=num_epochs,
+        num_batches=num_batches
     )
     optimizer = optim.Adam(learning_rate=lr_schedule)
     
-    # Define loss function for gradient calculation
-    def loss_fn(params, batch):
-        vqgan.update(params)  # Update model parameters
+    # Define loss function with vqgan in closure
+    def loss_fn(params, batch, current_epoch):
+        vqgan.update(params)
         reconstructed, quantized, indices = vqgan.forward(batch)
+        
+        # Reconstruction loss
         reconstruction_loss = (
-            0.8 * mx.mean((batch - reconstructed) ** 2) +  # L2 loss
-            0.2 * mx.mean(mx.abs(batch - reconstructed))   # L1 loss
+            0.7 * mx.mean((batch - reconstructed) ** 2) +  # L2 loss
+            0.3 * mx.mean(mx.abs(batch - reconstructed))   # L1 loss
         )
         
-        # Convert MLX arrays to numpy for CLIP with proper normalization
-        clip_input = mx.array(reconstructed).astype(mx.float32)
-        # Ensure values are in [0, 1] range for CLIP
-        clip_input = (clip_input + 1) * 0.5  # Changed normalization
+        # CLIP loss calculation
+        clip_input = (reconstructed + 1) * 0.5  # Scale to [0, 1]
         clip_input = mx.clip(clip_input, 0, 1)
+        clip_loss = 0.0  # Placeholder for now
         
-        # Ensure correct channel order (B, C, H, W) for CLIP
-        clip_input = clip_input.transpose(0, 3, 1, 2)
-        
-        # Convert to torch tensor with correct shape
-        clip_input = torch.tensor(clip_input.tolist())
-        
-        # Ensure input is exactly 224x224 as required by CLIP
-        if clip_input.shape[-1] != 224 or clip_input.shape[-2] != 224:
-            clip_input = torch.nn.functional.interpolate(
-                clip_input,
-                size=(224, 224),
-                mode='bicubic',  # Changed to bicubic for better quality
-                align_corners=False
-            )
-        
-        with torch.no_grad():
-            image_features = clip_model.encode_image(clip_input)
-            text_features = clip_model.encode_text(
-                tokenizer(["a high quality image"] * batch_size)
-            )
-        
-        # CLIP loss
-        clip_loss = mx.mean(
-            mx.matmul(
-                mx.array(image_features.numpy()),
-                mx.array(text_features.numpy()).T
-            )
-        )
-        
-        # Reduce CLIP weight if reconstruction is poor
-        clip_weight = 0.05  # Reduced from 0.1
+        # Combine losses
+        clip_weight = min(0.1, current_epoch / 20 * 0.1)
         total_loss = reconstruction_loss + clip_weight * clip_loss
         
         return total_loss
@@ -386,7 +362,7 @@ def train_vqgan_clip(
                 batch = mx.clip(batch, -1, 1)
                 
                 # Calculate loss and gradients
-                loss_value, gradients = mx.value_and_grad(loss_fn)(vqgan.parameters(), batch)
+                loss_value, gradients = mx.value_and_grad(lambda p, b: loss_fn(p, b, epoch))(vqgan.parameters(), batch)
                 
                 # Update model
                 optimizer.update(vqgan, gradients)
