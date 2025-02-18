@@ -181,6 +181,47 @@ class VQGANInference:
             print(f"Error in generate_images: {str(e)}")
             raise
 
+    def generate_with_multiple_temperatures(
+        self,
+        text_prompt: str,
+        num_samples: int = 1,
+        temperatures=[0.5, 0.8, 1.0],
+        return_best: bool = True
+    ):
+        """Generate images with multiple temperatures and return the best or all results"""
+        all_images = []
+        all_scores = []
+        
+        for temp in temperatures:
+            images = self.generate_images(
+                text_prompt=text_prompt,
+                num_samples=num_samples,
+                temperature=temp,
+                return_pil=True
+            )
+            
+            # Convert images back to tensor for CLIP scoring
+            for img in images:
+                img_np = np.array(img)
+                img_tensor = torch.tensor(img_np).float() / 255.0  # Normalize to [0,1]
+                img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)  # Add batch dimension
+                
+                with torch.no_grad():
+                    image_features = self.clip_model.encode_image(img_tensor)
+                    text_features = self.clip_model.encode_text(self.tokenizer([text_prompt]))
+                    
+                    # Calculate similarity score
+                    score = torch.cosine_similarity(image_features, text_features).item()
+                    
+                    all_images.append(img)
+                    all_scores.append(score)
+        
+        if return_best:
+            best_idx = np.argmax(all_scores)
+            return [all_images[best_idx]]
+        
+        return all_images
+
 def save_images(images, output_dir: str, prefix: str = "generated"):
     """Save generated images to disk"""
     output_dir = Path(output_dir)
@@ -197,18 +238,24 @@ if __name__ == "__main__":
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature')
     parser.add_argument('--output-dir', type=str, default='generated_images', help='Output directory')
     parser.add_argument('--prefix', type=str, default='generated', help='Prefix for output filenames')
+    parser.add_argument('--multi-temp', action='store_true', help='Use multiple temperatures')
     
     args = parser.parse_args()
     
     # Initialize model
     model = VQGANInference(checkpoint_path=args.checkpoint)
     
-    # Generate images with adjusted temperature
-    images = model.generate_images(
-        text_prompt=args.prompt,
-        num_samples=args.num_images,
-        temperature=args.temperature  # Remove the 0.1 scaling here
-    )
+    if args.multi_temp:
+        images = model.generate_with_multiple_temperatures(
+            text_prompt=args.prompt,
+            num_samples=args.num_images
+        )
+    else:
+        images = model.generate_images(
+            text_prompt=args.prompt,
+            num_samples=args.num_images,
+            temperature=args.temperature
+        )
     
     # Save the generated images
     save_images(images, args.output_dir, args.prefix)

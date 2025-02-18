@@ -169,13 +169,41 @@ def flatten_params(params, prefix=''):
                 flat_params[f"{prefix}{k}"] = v
     return flat_params
 
+def cosine_decay_schedule(initial_lr, min_lr, total_steps):
+    def schedule(step):
+        if step >= total_steps:
+            return min_lr
+        progress = step / total_steps
+        cosine_decay = 0.5 * (1 + mx.cos(mx.pi * progress))
+        return min_lr + (initial_lr - min_lr) * cosine_decay
+    return schedule
+
+def save_sample_images(vqgan, batch, epoch, output_dir):
+    """Save original and reconstructed images for visual comparison"""
+    reconstructed, _, _ = vqgan.forward(batch[:4])  # Take first 4 images
+    
+    # Convert from [-1, 1] to [0, 255] range
+    orig_imgs = ((batch[:4] + 1) * 127.5).astype(mx.uint8)
+    recon_imgs = ((reconstructed + 1) * 127.5).astype(mx.uint8)
+    
+    # Create a grid of original vs reconstructed
+    for i in range(4):
+        orig_img = Image.fromarray(orig_imgs[i].tolist())
+        recon_img = Image.fromarray(recon_imgs[i].tolist())
+        
+        # Save side by side comparison
+        combined = Image.new('RGB', (448, 224))  # 2x width for side by side
+        combined.paste(orig_img, (0, 0))
+        combined.paste(recon_img, (224, 0))
+        combined.save(os.path.join(output_dir, f'comparison_epoch{epoch}_sample{i}.png'))
+
 def train_vqgan_clip(
     media_folder: str,
     output_dir: str,
     batch_size: int = 8,
     num_epochs: int = 100,
-    learning_rate: float = 1e-4,
-    cache_file: str = "processed_images.pkl"
+    initial_learning_rate: float = 1e-4,
+    min_learning_rate: float = 1e-6
 ):
     # Validate input paths and permissions
     if not os.path.exists(media_folder):
@@ -200,29 +228,43 @@ def train_vqgan_clip(
     vqgan = VQGAN()
     
     # Load dataset with caching - hardcoded to 224x224 for CLIP compatibility
-    images = load_and_preprocess_images(media_folder, image_size=224, cache_file=cache_file)
+    images = load_and_preprocess_images(media_folder, image_size=224, cache_file="processed_images.pkl")
     
-    # Setup optimizer
-    optimizer = optim.Adam(learning_rate=learning_rate)
+    # Setup optimizer with learning rate schedule
+    lr_schedule = cosine_decay_schedule(
+        initial_learning_rate,
+        min_learning_rate,
+        num_epochs * (len(images) // batch_size)
+    )
+    optimizer = optim.Adam(learning_rate=lr_schedule)
     
     # Define loss function for gradient calculation
     def loss_fn(params, batch):
         vqgan.update(params)  # Update model parameters
         reconstructed, quantized, indices = vqgan.forward(batch)
-        reconstruction_loss = mx.mean((batch - reconstructed) ** 2)
+        reconstruction_loss = (
+            0.8 * mx.mean((batch - reconstructed) ** 2) +  # L2 loss
+            0.2 * mx.mean(mx.abs(batch - reconstructed))   # L1 loss
+        )
         
         # Convert MLX arrays to numpy for CLIP with proper normalization
         clip_input = mx.array(reconstructed).astype(mx.float32)
-        # Ensure values are in [0, 1] range
-        clip_input = mx.clip((clip_input + 1) / 2.0, 0, 1)
+        # Ensure values are in [0, 1] range for CLIP
+        clip_input = (clip_input + 1) * 0.5  # Changed normalization
+        clip_input = mx.clip(clip_input, 0, 1)
+        
+        # Ensure correct channel order (B, C, H, W) for CLIP
         clip_input = clip_input.transpose(0, 3, 1, 2)
         
+        # Convert to torch tensor with correct shape
         clip_input = torch.tensor(clip_input.tolist())
+        
+        # Ensure input is exactly 224x224 as required by CLIP
         if clip_input.shape[-1] != 224 or clip_input.shape[-2] != 224:
             clip_input = torch.nn.functional.interpolate(
                 clip_input,
                 size=(224, 224),
-                mode='bilinear',
+                mode='bicubic',  # Changed to bicubic for better quality
                 align_corners=False
             )
         
@@ -240,10 +282,23 @@ def train_vqgan_clip(
             )
         )
         
-        # Add weighting factors
-        total_loss = reconstruction_loss + 0.1 * clip_loss
+        # Reduce CLIP weight if reconstruction is poor
+        clip_weight = 0.05  # Reduced from 0.1
+        total_loss = reconstruction_loss + clip_weight * clip_loss
         
         return total_loss
+
+    # Add validation of training images
+    print("Validating training data...")
+    image_stats = {
+        'min': mx.min(images),
+        'max': mx.max(images),
+        'mean': mx.mean(images),
+        'std': mx.std(images)
+    }
+    print(f"Image statistics: {image_stats}")
+    if image_stats['min'] < -1 or image_stats['max'] > 1:
+        print("Warning: Images outside expected [-1, 1] range")
 
     # Training loop
     try:
@@ -251,7 +306,7 @@ def train_vqgan_clip(
         print(f"Training config:")
         print(f"- Batch size: {batch_size}")
         print(f"- Number of epochs: {num_epochs}")
-        print(f"- Learning rate: {learning_rate}")
+        print(f"- Learning rate: {initial_learning_rate}")
         print(f"- Output directory: {output_dir}")
         
         for epoch in range(num_epochs):
@@ -265,6 +320,9 @@ def train_vqgan_clip(
             
             for i in batch_iterator:
                 batch = images[i * batch_size:(i + 1) * batch_size]
+                
+                # Ensure input batch is properly normalized to [-1, 1]
+                batch = mx.clip(batch, -1, 1)
                 
                 # Calculate loss and gradients
                 loss_value, gradients = mx.value_and_grad(loss_fn)(vqgan.parameters(), batch)
@@ -299,7 +357,16 @@ def train_vqgan_clip(
             print(f"  Reconstruction Loss: {avg_reconstruction_loss:.4f}")
             print(f"  CLIP Loss: {avg_clip_loss:.4f}")
             
+            if (epoch + 1) % 5 == 0:  # Save samples every 5 epochs
+                save_sample_images(vqgan, batch, epoch + 1, output_dir)
+                
             if (epoch + 1) % 10 == 0:
+                # Add model statistics logging
+                for name, param in vqgan.parameters().items():
+                    if isinstance(param, mx.array):
+                        print(f"{name} stats: min={mx.min(param):.4f}, max={mx.max(param):.4f}, "
+                              f"mean={mx.mean(param):.4f}, std={mx.std(param):.4f}")
+                
                 checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}.npz")
                 params_dict = flatten_params(vqgan.parameters())
                 
@@ -332,5 +399,5 @@ if __name__ == "__main__":
         output_dir="vqgan_output",
         batch_size=8,
         num_epochs=100,
-        learning_rate=1e-4
+        initial_learning_rate=1e-4
     )
